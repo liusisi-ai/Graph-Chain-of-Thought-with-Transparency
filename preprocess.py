@@ -235,7 +235,7 @@ def process_node_and_generate_prompt(
     return result
 
 
-def generate_prompts_dataset(original_X, config: PromptConfig):
+def generate_prompts_dataset(original_X, config: PromptConfig, token_map=None):
     prompt_dir = os.path.join("dataset", config.DATASET_NAME, "prompt")
     os.makedirs(prompt_dir, exist_ok=True)
 
@@ -250,7 +250,10 @@ def generate_prompts_dataset(original_X, config: PromptConfig):
     G = build_graph_from_pyg(pyg_data, all_node_ids)
     if G is None: return
 
-    token_map = serialize_graph_tokens(pyg_data, G, all_node_ids)
+    if token_map is None:
+        token_map = serialize_graph_tokens(pyg_data, G, all_node_ids)
+    else:
+        print(f"✅ Using pre-built token_map. Total: {len(token_map)}")
 
     emb = load_embeddings(config.DATASET_NAME, config.thought, config.epoch)
     if emb is None:
