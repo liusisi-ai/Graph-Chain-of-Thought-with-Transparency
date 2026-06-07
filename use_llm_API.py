@@ -7,20 +7,59 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import time
 import warnings
 from typing import Dict, Any, Tuple
-from openai import OpenAI  # pip install openai
+
+from config import LOCAL_LLM_PATH
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-USE_API = True
+# Default to local LLM (vicuna) – set to True only when an OpenAI-compatible
+# endpoint and key are available. Can also be overridden via env var ``USE_API``.
+USE_API = os.environ.get("USE_API", "0").lower() in ("1", "true", "yes")
 
 API_CONFIG = {
-    "api_key": "",
-    "base_url": "https://api.openai.com/v1",
-    "model_name": "gpt-4.1",
-    "temperature": 0.2
+    "api_key": os.environ.get("OPENAI_API_KEY", ""),
+    "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    "model_name": os.environ.get("OPENAI_MODEL", "gpt-4.1"),
+    "temperature": 0.2,
 }
 
-LOCAL_MODEL_PATH = "vicuna-7b-v1.5-16k"
+# Local dir or HuggingFace model id (e.g. 'lmsys/vicuna-7b-v1.5-16k').
+LOCAL_MODEL_PATH = LOCAL_LLM_PATH
+
+
+def _try_import_openai():
+    """Lazy import of ``openai`` so the module works without the package
+    installed when only the local LLM is used."""
+    try:
+        from openai import OpenAI  # pip install openai
+        return OpenAI
+    except ImportError as e:
+        raise ImportError(
+            "USE_API=True but the `openai` package is not installed. "
+            "Either run `pip install openai`, set USE_API=0, or call "
+            "LLM_Predictor(use_api=False) to use the local LLM."
+        ) from e
+
+
+def _print_vram_summary():
+    """Pretty-print available CUDA memory before loading the LLM."""
+    if not torch.cuda.is_available():
+        print("ℹ️ CUDA not available — model will load on CPU (very slow).")
+        return None, 0.0
+    idx = torch.cuda.current_device()
+    name = torch.cuda.get_device_name(idx)
+    total = torch.cuda.get_device_properties(idx).total_memory / 1024 ** 3
+    free = (torch.cuda.mem_get_info()[0] / 1024 ** 3) if hasattr(torch.cuda, "mem_get_info") else total
+    print(f"🖥️ GPU[{idx}] {name}  total={total:.1f} GB  free={free:.1f} GB")
+    return name, free
+
+
+def _need_4bit(local_path: str, free_gib: float) -> bool:
+    """Return True when fp16 loading is unlikely to fit in the current GPU."""
+    is_7b = "7b" in local_path.lower() or "7B" in local_path
+    # rough fp16 weight footprint + activation overhead
+    needed_fp16 = 14.0 if is_7b else 26.0   # 13b ≈ 26 GB
+    return free_gib < needed_fp16 * 0.9
 
 
 
@@ -47,6 +86,7 @@ class LLM_Predictor:
         if self.use_api:
             print(f"🚀 [Init] 初始化 API 客户端 ({API_CONFIG['model_name']})...")
             try:
+                OpenAI = _try_import_openai()
                 self.client = OpenAI(
                     api_key=API_CONFIG["api_key"],
                     base_url=API_CONFIG["base_url"]
@@ -55,29 +95,62 @@ class LLM_Predictor:
             except Exception as e:
                 print(f"❌ API 初始化失败: {e}")
         else:
-            print(f"🚀 [Init] 正在加载本地模型: {local_path} ...")
-            if not os.path.isdir(local_path):
-                print(f"❌ 错误：模型路径不存在: {local_path}")
-                return
+            is_hf_id = not os.path.isdir(local_path)
+            src = "HuggingFace Hub" if is_hf_id else "local dir"
+            print(f"🚀 [Init] Loading LLM from {src}: {local_path} ...")
+
+            _, free_gib = _print_vram_summary()
+            use_4bit = os.environ.get("LLM_4BIT", "auto")
+            if use_4bit == "auto":
+                use_4bit = _need_4bit(local_path, free_gib)
+            else:
+                use_4bit = use_4bit.lower() in ("1", "true", "yes")
+
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"检测到的设备: {self.device}  (4bit={'on' if use_4bit else 'off'})")
 
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                print(f"检测到的设备: {self.device}")
-
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    local_path,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    low_cpu_mem_usage=True
+                model_kwargs: Dict[str, Any] = dict(
+                    device_map="auto" if torch.cuda.is_available() else None,
+                    low_cpu_mem_usage=True,
                 )
+                if use_4bit:
+                    try:
+                        from transformers import BitsAndBytesConfig
+                        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_use_double_quant=True,
+                        )
+                        print("ℹ️ Using 4-bit (NF4) quantization to fit the GPU.")
+                    except Exception as e:
+                        print(f"⚠️ Cannot enable 4-bit quantisation ({e}); falling back to fp16.")
+                        model_kwargs["torch_dtype"] = torch.float16
+                else:
+                    model_kwargs["torch_dtype"] = torch.float16
+
+                self.model = AutoModelForCausalLM.from_pretrained(local_path, **model_kwargs)
                 self.model.eval()
                 print(f"✅ 本地模型加载成功!")
             except Exception as e:
-                print(f"❌ 本地模型加载失败: {e}")
+                msg = str(e).lower()
+                hint = ""
+                if "out of memory" in msg or "cuda oom" in msg or "cublas" in msg:
+                    hint = (
+                        "\n💡 GPU 显存不足。Vicuna-7B fp16 需要 ~14 GB 可用显存。"
+                        "可选方案：\n"
+                        "  1) 启用 4-bit 量化：export LLM_4BIT=1 (需要 bitsandbytes==0.41.x)，仅需 ~5 GB 显存\n"
+                        "  2) 升级到 24 GB 显卡 (RTX 3090 / 4090 / A5000 / A6000)\n"
+                        "  3) 改用更小模型：在 config.py 把 HF_LLM_ID 改成 'lmsys/vicuna-7b-v1.5' 之外的小模型，例如 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'"
+                    )
+                elif "no module named 'bitsandbytes'" in msg:
+                    hint = "\n💡 请安装 bitsandbytes：pip install bitsandbytes==0.41.3"
+                raise RuntimeError(f"❌ 本地模型加载失败: {e}{hint}") from e
 
     def predict(self, prompt: str) -> str:
         if self.use_api:
